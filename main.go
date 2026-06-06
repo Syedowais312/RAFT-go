@@ -30,11 +30,14 @@ type Node struct {
 	log         []LogEntry
 	commitIndex int
 	nextIndex   []int
+	matchIndex  []int
 	mu          sync.Mutex
 }
 type RequestVoteArgs struct {
-	term        int
-	candidateID int
+	term         int
+	candidateID  int
+	lastLogIndex int
+	lastLogTerm  int
 }
 type RequestVoteReply struct {
 	candidateID int
@@ -59,6 +62,7 @@ type AppendEntriesReply struct {
 func main() {
 	node := make([]*Node, 5)
 
+	// Initialize nodes
 	for i := 0; i < 5; i++ {
 		node[i] = &Node{
 			ID:        i,
@@ -67,9 +71,10 @@ func main() {
 			voted:     -1,
 			alive:     true,
 		}
+		go node[i].applyLoop()
 
 	}
-
+	// Set peers for each node
 	for i, n := range node {
 		for j, m := range node {
 			if i != j {
@@ -77,6 +82,7 @@ func main() {
 			}
 		}
 	}
+	// Start election timers for each node
 	for i, n := range node {
 		go n.runElectionTimer()
 		fmt.Println("Node", i, "runing")
@@ -84,6 +90,7 @@ func main() {
 	time.Sleep(500 * time.Millisecond)
 	for _, n := range node {
 		if n.currstate == Leader {
+			// submit some commands to the leader as entry
 			n.Submit("hello")
 			n.Submit("world")
 			fmt.Println("Submitted to Node", n.ID)
@@ -114,9 +121,37 @@ func main() {
 	}
 
 }
+
+func (n *Node) applyLoop() {
+	lastApplied := -1
+	for {
+		time.Sleep(10 * time.Millisecond)
+		n.mu.Lock()
+		if lastApplied < n.commitIndex && lastApplied+1 < len(n.log) {
+			lastApplied++
+			entry := n.log[lastApplied]
+			fmt.Printf("Node %d applied command: %v from term %d\n", n.ID, entry.Command, entry.Term)
+		}
+		n.mu.Unlock()
+	}
+}
 func (n *Node) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	lastLogIndex := len(n.log) - 1
+	lastLogTerm := 0
+	if lastLogIndex >= 0 {
+		lastLogTerm = n.log[lastLogIndex].Term
+	}
+
+	if args.lastLogTerm < lastLogTerm {
+		reply.vote = false
+		return
+	}
+	if args.lastLogTerm == lastLogTerm && args.lastLogIndex < lastLogIndex {
+		reply.vote = false
+		return
+	}
 	if args.term < n.term {
 		reply.vote = false
 		return
@@ -158,6 +193,7 @@ func (n *Node) runElectionTimer() {
 			return
 		} else if time.Since(n.timer) > timeout {
 			fmt.Println("Node", n.ID, "timeout, starting election")
+			// start election for the node that lucks out and becomes candidate
 			go n.startElection()
 			n.mu.Unlock()
 			return
@@ -171,18 +207,29 @@ func (n *Node) startElection() {
 		n.mu.Unlock()
 		return // aborted before we even started
 	}
+	// make this node a candidate and start election(if follower or candidate)
 	n.currstate = Candidate
+	// increment term and vote for self
 	n.term++
 	currentTerm := n.term
 	n.voted = n.ID
 	n.mu.Unlock()
 	voteCh := make(chan bool, len(n.peers))
 
+	n.mu.Lock()
+	lastLogIndex := len(n.log) - 1
+	lastLogTerm := 0
+	if lastLogIndex >= 0 {
+		lastLogTerm = n.log[lastLogIndex].Term
+	}
+	n.mu.Unlock()
 	for _, p := range n.peers {
 		go func(peer *Node) {
 			args := RequestVoteArgs{
-				term:        currentTerm,
-				candidateID: n.ID,
+				term:         currentTerm,
+				candidateID:  n.ID,
+				lastLogIndex: lastLogIndex,
+				lastLogTerm:  lastLogTerm,
 			}
 
 			reply := RequestVoteReply{}
@@ -207,15 +254,17 @@ func (n *Node) startElection() {
 		go n.runElectionTimer()
 		return
 	}
-
+	// if majority votes received, become leader
 	if votes > len(n.peers)/2 {
 		if n.currstate != Candidate {
 			return
 		}
 		n.currstate = Leader
 		n.nextIndex = make([]int, len(n.peers))
+		n.matchIndex = make([]int, len(n.peers))
 		for i := range n.nextIndex {
 			n.nextIndex[i] = len(n.log)
+			n.matchIndex[i] = -1
 		}
 		go n.sendHeartbeat()
 		fmt.Println("Node", n.ID, "is now leader!")
@@ -277,9 +326,28 @@ func (n *Node) sendHeartbeat() {
 				peer.AppendEntries(args, &AppendEntriesReply)
 				n.mu.Lock()
 				if AppendEntriesReply.success {
+					// if heartbeat is successful, update nextIndex for that peer
 					n.nextIndex[peerIndex] = 1 + prevLogIndex + len(args.entries)
+
+					n.matchIndex[peerIndex] = n.nextIndex[peerIndex] - 1
+
+					for idx := len(n.log) - 1; idx > n.commitIndex; idx-- {
+						count := 1
+						for _, match := range n.matchIndex {
+							if match >= idx {
+								count++
+							}
+
+						}
+						if count > len(n.peers)/2 {
+							n.commitIndex = idx
+							fmt.Println("Commit index updated to ", n.commitIndex)
+							break
+						}
+					}
 					fmt.Println("Heartbeat success to ", peer.ID)
 				} else {
+					// if heartbeat fails, decrement nextIndex for that peer and try again in next heartbeat
 					if n.nextIndex[peerIndex] > 0 {
 						n.nextIndex[peerIndex]--
 						fmt.Println("Heartbeat failed to ", peer.ID, "decreasing nextIndex to ", n.nextIndex[peerIndex])
