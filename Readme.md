@@ -1,7 +1,6 @@
 ## Raft-Go
 
-A simplified implementation of the Raft consensus algorithm written in Go. If you have no idea what Raft is, make sure to read the blog first (once published i will update it)
-
+A simplified implementation of the Raft consensus algorithm written in Go. If you have no idea what Raft is, make sure to read the blog first [How RAFT works](https://medium.com/@syedowais312sf/how-raft-keeps-your-data-safe-when-servers-crash-da3f42c41438) 
 ### How to run
 ```bash
 go run main.go
